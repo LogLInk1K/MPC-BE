@@ -11139,7 +11139,25 @@ void CMainFrame::ToggleFullscreen(bool fToNearest, bool fSwitchScreenResWhenHasT
 			m_hWnd, DWMWA_CLOAK, &bCloak, sizeof(bCloak)));
 	}
 
-	ModifyStyle(dwRemove, dwAdd, SWP_NOZORDER);
+	// Toggling WS_CAPTION|WS_THICKFRAME forces DWM to recompute the non-client
+	// area, and during that recompute the window can briefly paint in its
+	// uncomposited (legacy/Basic) appearance for one frame -- visible as a
+	// flash of the old glass/white-border/title-bar look even on Windows 11.
+	// The DWMWA_CLOAK above already hides the window from the compositor, but
+	// on some GPUs the NC recompute frame still leaks through. Suppress all
+	// painting around the style change + geometry move via WM_SETREDRAW so the
+	// intermediate frame is dropped at the source. The window is repainted
+	// once, in its final state, after MoveVideoWindow().
+	SendMessageW(WM_SETREDRAW, FALSE, 0);
+
+	// SWP_FRAMECHANGED is required here: without it the non-client area is not
+	// recomputed, so GetWindowRect()/CChildView client rect keep the OLD caption
+	// thickness and the video window (MoveVideoWindow) is sized to a wrong rect
+	// (only a part of the video shows, or it keeps the fullscreen size after
+	// exiting). Adding SWP_FRAMECHANGED forces a correct WM_NCCALCSIZE/WM_SIZE so
+	// the layout is right immediately. The WM_SETREDRAW(FALSE) above suppresses
+	// the one legacy/Basic frame that this NC recompute would otherwise flash.
+	ModifyStyle(dwRemove, dwAdd, SWP_NOZORDER | SWP_FRAMECHANGED);
 
 	static bool bChangeMonitor = false;
 	// try disable shader when move from one monitor to other ...
@@ -11251,6 +11269,25 @@ void CMainFrame::ToggleFullscreen(bool fToNearest, bool fSwitchScreenResWhenHasT
 
 	m_bFullScreenChangingMode = false;
 	MoveVideoWindow();
+
+	// Re-enable painting now that both the top-level window and the video child
+	// have their final rectangles, and repaint everything once in its final
+	// state. This complements DWMWA_CLOAK: the intermediate (legacy/Basic) frame
+	// produced by the WS_CAPTION toggle is dropped at the source, so it can no
+	// longer leak through when the cloak is lifted below.
+	SendMessageW(WM_SETREDRAW, TRUE, 0);
+	RedrawWindow(nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+
+	// When the media is loaded but not actively decoding (e.g. paused) there is
+	// no decoding progress to trigger a later layout refresh, so the corrected
+	// video rectangle (now that SWP_FRAMECHANGED has recomputed the non-client
+	// area) must be applied and painted explicitly here; otherwise the
+	// wrong/legacy-sized window stays visible. MoveVideoWindow() is a no-op when
+	// no media is loaded, so this is safe in all states.
+	if (m_eMediaLoadState == MLS_LOADED) {
+		MoveVideoWindow();
+		RedrawWindow(nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+	}
 
 	// Reveal only after the final top-level and video-child geometry has been
 	// processed. Wait for the compositor to reach the transition's final
